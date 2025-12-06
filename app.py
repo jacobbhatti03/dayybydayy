@@ -2,7 +2,8 @@
 """
 DayByDay — Streamlit single-file app
 - Local username/password auth (hashed with bcrypt)
-- No global auto-login across devices (no shared session.json)
+- Per-user session persistence (project + chat + last page) in session.json
+- Auto-login remembered user only for 24 hours (auth.json)
 - Gemini AI integration
 - 8-day AI-generated plan parsed into editable day cards
 - Separate Chat tab for DayBot
@@ -15,7 +16,7 @@ DayByDay — Streamlit single-file app
 import os
 import json
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 import re
 import uuid
 
@@ -55,11 +56,16 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 # Optional: disable signup for other people (set ALLOW_SIGNUP=false in .env)
 ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "true").lower() == "true"
 
+# Remember-login timeout
+SESSION_TTL_HOURS = 24
+
 # ---------------------------
 # File paths
 # ---------------------------
 USERS_FILE = DATA_DIR / "users.json"
 PROJECTS_FILE = DATA_DIR / "projects.json"
+SESSION_FILE = DATA_DIR / "session.json"  # per-user saved session
+AUTH_FILE = DATA_DIR / "auth.json"        # who is logged in + when
 
 # ---------------------------
 # File helpers
@@ -86,6 +92,8 @@ def write_json(p: Path, obj):
 # Ensure files exist
 ensure_file(USERS_FILE, {})
 ensure_file(PROJECTS_FILE, {})
+ensure_file(SESSION_FILE, {})
+ensure_file(AUTH_FILE, {})
 
 # ---------------------------
 # Password helpers (bcrypt)
@@ -98,6 +106,78 @@ def verify_password(password: str, password_hash: str) -> bool:
         return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
     except Exception:
         return False
+
+# ---------------------------
+# Per-user session persistence
+# ---------------------------
+def load_user_session(username: str):
+    """Load saved session data for a specific user (project, chat, last page)."""
+    all_sessions = read_json(SESSION_FILE, {})
+    return all_sessions.get(username, {})
+
+def persist_session():
+    """Save current user's project + chat + page to SESSION_FILE."""
+    user = st.session_state.get("user")
+    if not user:
+        return
+    all_sessions = read_json(SESSION_FILE, {})
+    all_sessions[user] = {
+        "project": st.session_state.get("project"),
+        "chat_history": st.session_state.get("chat_history", []),
+        "page": st.session_state.get("page", "home"),
+        "saved_at": datetime.utcnow().isoformat()
+    }
+    write_json(SESSION_FILE, all_sessions)
+
+# ---------------------------
+# Auth helpers (remember user for 24h)
+# ---------------------------
+def set_auth_user(username: str):
+    """Record who is logged in, and when."""
+    data = {
+        "user": username,
+        "login_at": datetime.utcnow().isoformat()
+    }
+    write_json(AUTH_FILE, data)
+
+def clear_auth():
+    """Forget current user (no auto-login next time)."""
+    write_json(AUTH_FILE, {})
+
+def try_auto_login():
+    """
+    If there is a remembered user in auth.json and the login is less
+    than 24 hours old, auto-login them and restore their session.
+    """
+    if st.session_state.get("user"):
+        return  # already logged in for this browser session
+
+    auth = read_json(AUTH_FILE, {})
+    user = auth.get("user")
+    ts = auth.get("login_at")
+    if not user or not ts:
+        return
+
+    try:
+        t = datetime.fromisoformat(ts)
+    except Exception:
+        clear_auth()
+        return
+
+    if datetime.utcnow() - t > timedelta(hours=SESSION_TTL_HOURS):
+        # login expired
+        clear_auth()
+        return
+
+    # Auto-login valid remembered user
+    st.session_state.user = user
+    user_sess = load_user_session(user)
+    if user_sess:
+        st.session_state.project = user_sess.get("project", st.session_state.project)
+        st.session_state.chat_history = user_sess.get("chat_history", [])
+        st.session_state.page = user_sess.get("page", "home")
+    else:
+        st.session_state.page = "home"
 
 # ---------------------------
 # Session state defaults (per browser session)
@@ -121,6 +201,9 @@ if "ask_context" not in st.session_state:
     st.session_state.ask_context = None
 if "show_planner" not in st.session_state:
     st.session_state.show_planner = False
+
+# Try to auto-login remembered user (if within 24h)
+try_auto_login()
 
 # ---------------------------
 # Local Auth
@@ -153,10 +236,8 @@ def login_local(username: str, password: str):
         if not verify_password(password, u["password_hash"]):
             return False, "Incorrect password."
     else:
-        # Old version had "password" stored in plain text
         if u.get("password") != password:
             return False, "Incorrect password."
-        # On successful login, upgrade to hashed password
         u["password_hash"] = hash_password(password)
         u.pop("password", None)
         users[username] = u
@@ -178,6 +259,7 @@ def save_user_project(username: str, project: dict):
     project["updated_at"] = datetime.utcnow().isoformat()
     allp[username][project["title"]] = project
     write_json(PROJECTS_FILE, allp)
+    persist_session()
 
 # ---------------------------
 # Gemini AI helpers
@@ -198,7 +280,6 @@ def call_gemini_text(prompt, max_tokens=400):
             return True, resp.text.strip()
         return False, "DayBot had no response."
     except Exception:
-        # In production you would log the exception somewhere private
         return False, "DayBot is currently unavailable. Please try again."
 
 # ---------------------------
@@ -210,7 +291,6 @@ def parse_plan_to_tasks(plan_text: str):
     if not plan_text:
         return days
 
-    # Split into blocks starting at "Day X"
     blocks = re.split(r"(?=Day\s*\d+[:\-])", plan_text, flags=re.IGNORECASE)
     for i in range(1, 9):
         block = next(
@@ -229,7 +309,6 @@ def parse_plan_to_tasks(plan_text: str):
         for text in lines:
             days[i - 1].append({"id": None, "text": text, "done": False})
 
-    # Assign IDs
     nid = 0
     for d in range(8):
         for t in days[d]:
@@ -239,10 +318,6 @@ def parse_plan_to_tasks(plan_text: str):
     return days
 
 def normalize_tasks(raw_tasks):
-    """
-    Convert a list of string tasks or mixed dicts to a list of task dicts:
-    {id:int, text:str, done:bool}.
-    """
     normalized = []
     for t in raw_tasks:
         if isinstance(t, str):
@@ -260,7 +335,6 @@ def normalize_tasks(raw_tasks):
     return normalized
 
 def assign_missing_ids(tasks_by_day):
-    """Ensure every task has a unique integer id."""
     all_ids = [
         t["id"]
         for day in tasks_by_day
@@ -279,10 +353,6 @@ def assign_missing_ids(tasks_by_day):
 # AI plan generation
 # ---------------------------
 def generate_8day_plan(title: str, desc: str):
-    """
-    Generate an 8-day plan using Gemini AI, parse it into structured tasks,
-    normalize tasks, save project, and switch to planner.
-    """
     if not title.strip():
         return False, "Project title is required.", None
 
@@ -323,8 +393,8 @@ def generate_8day_plan(title: str, desc: str):
     st.session_state.project = project
     save_user_project(st.session_state.user, project)
 
-    # Switch to planner page for this session only
     st.session_state.page = "planner"
+    persist_session()
 
     return True, "AI 8-day plan generated successfully!", project
 
@@ -367,6 +437,7 @@ st.markdown(
 # ---------------------------
 def go_to(page_name):
     st.session_state.page = page_name
+    persist_session()
 
 # ---------------------------
 # Pages
@@ -384,14 +455,29 @@ def page_login_signup():
             ok, msg = login_local(login_user.strip(), login_pass)
             if ok:
                 st.session_state.user = login_user.strip()
+
+                # Load saved session (project + chat + last page) for this user
+                user_sess = load_user_session(st.session_state.user)
+                if user_sess:
+                    st.session_state.project = user_sess.get("project", st.session_state.project)
+                    st.session_state.chat_history = user_sess.get("chat_history", [])
+                    st.session_state.page = user_sess.get("page", "home")
+                else:
+                    st.session_state.page = "home"
+
+                # Also load projects (for home dropdown if needed)
                 projects = load_user_projects(st.session_state.user)
-                if projects:
+                if projects and not user_sess:
                     last_title = max(
                         projects.items(),
                         key=lambda kv: kv[1].get("updated_at", kv[1].get("generated_at", ""))
                     )[0]
                     st.session_state.project = projects[last_title]
-                go_to("home")
+
+                # Remember this user for 24h
+                set_auth_user(st.session_state.user)
+                persist_session()
+                st.experimental_rerun()
             else:
                 st.error(msg)
 
@@ -419,8 +505,12 @@ def page_login_signup():
                         "updated_at": None,
                         "raw_plan": ""
                     }
-                    go_to("home")
+                    st.session_state.chat_history = []
+                    st.session_state.page = "home"
+                    set_auth_user(st.session_state.user)
+                    persist_session()
                     st.success("Account created; welcome!")
+                    st.experimental_rerun()
                 else:
                     st.error(msg)
 
@@ -448,6 +538,7 @@ def page_home():
             if selected != "-- select --":
                 if st.button("Open Project", key="open_proj_btn"):
                     st.session_state.project = projects[selected]
+                    persist_session()
                     go_to("planner")
 
     with right:
@@ -462,6 +553,7 @@ def page_home():
                 "raw_plan": ""
             }
             st.session_state.show_planner = False
+            persist_session()
             go_to("create")
 
 # ---------------------------
@@ -491,6 +583,7 @@ def page_create():
     else:
         if st.session_state.project and st.button("🗓️ Open Planner"):
             st.session_state.show_planner = True
+            persist_session()
             page_planner()
 
 # ---------------------------
@@ -599,6 +692,7 @@ def page_chat():
                 {"role": "daybot", "text": "DayBot unavailable.", "time": now}
             )
         st.session_state.ask_context = None
+        persist_session()
 
     for msg in st.session_state.chat_history[-100:]:
         label = "You" if msg.get("role") == "user" else "DayBot"
@@ -634,6 +728,7 @@ def page_chat():
                 st.session_state.chat_history.append(
                     {"role": "daybot", "text": "DayBot unavailable.", "time": now}
                 )
+            persist_session()
 
     if st.session_state.chat_history:
         last = st.session_state.chat_history[-1]
@@ -667,6 +762,7 @@ def page_chat():
                             nid += 1
 
                     save_user_project(st.session_state.user, proj)
+                    persist_session()
                     st.success("Imported into tasks.")
 
 # ---------------------------
@@ -695,6 +791,9 @@ def render_sidebar():
         st.markdown("<div class='sidebar-spacer'></div>", unsafe_allow_html=True)
         st.markdown("---")
         if st.button("Logout"):
+            # Save final snapshot, then clear auth + in-memory state
+            persist_session()
+            clear_auth()
             st.session_state.user = None
             st.session_state.project = {
                 "title": "",
@@ -705,8 +804,9 @@ def render_sidebar():
                 "raw_plan": ""
             }
             st.session_state.chat_history = []
-            go_to("login")
+            st.session_state.page = "login"
             st.success("Logged out.")
+            st.experimental_rerun()
 
 # ---------------------------
 # Main router
