@@ -2,12 +2,14 @@
 """
 DayByDay — Streamlit single-file app
 - Local username/password auth (hashed with bcrypt)
-- Per-user session persistence (project + chat + last page) in session.json
-- Auto-login remembered user only for 24 hours (auth.json)
+- Per-device login memory using browser cookies (24h)
+- Per-user session persistence (project + chat + last page)
 - Gemini AI integration
-- 8-day AI-generated plan parsed into editable day cards
-- Separate Chat tab for DayBot
-- Full task dicts with stable IDs & "done" flag
+- 8-day AI plan generation with parsing
+- Planner with task editing, adding, deleting, checkboxes
+- Chat tab with contextual DayBot improvements
+- No auth.json (removed for multi-device privacy)
+- No session leakage between users
 """
 
 # ---------------------------
@@ -19,17 +21,15 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import re
 import uuid
-
+import bcrypt
 from dotenv import load_dotenv
 import streamlit as st
-import bcrypt
 
-# Gemini AI import attempt
+# Gemini import
 try:
     import google.generativeai as genai
     HAS_GENAI = True
 except Exception:
-    genai = None
     HAS_GENAI = False
 
 # ---------------------------
@@ -42,21 +42,19 @@ st.set_page_config(
 )
 
 # ---------------------------
-# Load environment
+# Load environment variables
 # ---------------------------
 load_dotenv()
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# All app data in a dedicated folder (easy to keep private / .gitignore)
 DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Optional: disable signup for other people (set ALLOW_SIGNUP=false in .env)
 ALLOW_SIGNUP = os.getenv("ALLOW_SIGNUP", "true").lower() == "true"
 
-# Remember-login timeout
+# Per-device cookie session length
 SESSION_TTL_HOURS = 24
 
 # ---------------------------
@@ -64,39 +62,36 @@ SESSION_TTL_HOURS = 24
 # ---------------------------
 USERS_FILE = DATA_DIR / "users.json"
 PROJECTS_FILE = DATA_DIR / "projects.json"
-SESSION_FILE = DATA_DIR / "session.json"  # per-user saved session
-AUTH_FILE = DATA_DIR / "auth.json"        # who is logged in + when
+SESSION_FILE = DATA_DIR / "session.json"
 
 # ---------------------------
-# File helpers
+# Helpers for JSON files
 # ---------------------------
-def ensure_file(p: Path, default):
-    if not p.exists():
-        with open(p, "w", encoding="utf-8") as f:
+def ensure_file(path: Path, default):
+    if not path.exists():
+        with open(path, "w", encoding="utf-8") as f:
             json.dump(default, f, indent=2, ensure_ascii=False)
 
-def read_json(p: Path, default=None):
-    default = default or {}
+def read_json(path: Path, default=None):
     try:
-        with open(p, "r", encoding="utf-8") as f:
+        with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except Exception:
-        return default
+        return default or {}
 
-def write_json(p: Path, obj):
-    tmp = p.with_suffix(".tmp")
+def write_json(path: Path, obj):
+    tmp = path.with_suffix(".tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
-    tmp.replace(p)
+    tmp.replace(path)
 
-# Ensure files exist
+# Ensure system files exist
 ensure_file(USERS_FILE, {})
 ensure_file(PROJECTS_FILE, {})
 ensure_file(SESSION_FILE, {})
-ensure_file(AUTH_FILE, {})
 
 # ---------------------------
-# Password helpers (bcrypt)
+# Bcrypt password helpers
 # ---------------------------
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
@@ -111,15 +106,14 @@ def verify_password(password: str, password_hash: str) -> bool:
 # Per-user session persistence
 # ---------------------------
 def load_user_session(username: str):
-    """Load saved session data for a specific user (project, chat, last page)."""
-    all_sessions = read_json(SESSION_FILE, {})
-    return all_sessions.get(username, {})
+    sessions = read_json(SESSION_FILE, {})
+    return sessions.get(username, {})
 
 def persist_session():
-    """Save current user's project + chat + page to SESSION_FILE."""
     user = st.session_state.get("user")
     if not user:
         return
+
     all_sessions = read_json(SESSION_FILE, {})
     all_sessions[user] = {
         "project": st.session_state.get("project"),
@@ -130,62 +124,34 @@ def persist_session():
     write_json(SESSION_FILE, all_sessions)
 
 # ---------------------------
-# Auth helpers (remember user for 24h)
+# Cookie-based login (per device)
 # ---------------------------
-def set_auth_user(username: str):
-    """Record who is logged in, and when."""
-    data = {
-        "user": username,
-        "login_at": datetime.utcnow().isoformat()
-    }
-    write_json(AUTH_FILE, data)
+COOKIE_NAME = "daybyday_user"
 
-def clear_auth():
-    """Forget current user (no auto-login next time)."""
-    write_json(AUTH_FILE, {})
+def set_cookie_user(username: str):
+    expiry = datetime.utcnow() + timedelta(hours=SESSION_TTL_HOURS)
+    st.set_cookie(
+        COOKIE_NAME,
+        username,
+        expires=expiry,
+        secure=False,
+        httponly=False,
+        samesite="Lax"
+    )
 
-def try_auto_login():
-    """
-    If there is a remembered user in auth.json and the login is less
-    than 24 hours old, auto-login them and restore their session.
-    """
-    if st.session_state.get("user"):
-        return  # already logged in for this browser session
+def clear_cookie_user():
+    st.set_cookie(COOKIE_NAME, "", expires=datetime.utcnow())
 
-    auth = read_json(AUTH_FILE, {})
-    user = auth.get("user")
-    ts = auth.get("login_at")
-    if not user or not ts:
-        return
-
-    try:
-        t = datetime.fromisoformat(ts)
-    except Exception:
-        clear_auth()
-        return
-
-    if datetime.utcnow() - t > timedelta(hours=SESSION_TTL_HOURS):
-        # login expired
-        clear_auth()
-        return
-
-    # Auto-login valid remembered user
-    st.session_state.user = user
-    user_sess = load_user_session(user)
-    if user_sess:
-        st.session_state.project = user_sess.get("project", st.session_state.project)
-        st.session_state.chat_history = user_sess.get("chat_history", [])
-        st.session_state.page = user_sess.get("page", "home")
-    else:
-        st.session_state.page = "home"
+def get_cookie_user():
+    return st.cookies.get(COOKIE_NAME)
 
 # ---------------------------
-# Session state defaults (per browser session)
+# Session State Defaults
 # ---------------------------
-if "page" not in st.session_state:
-    st.session_state.page = "login"
 if "user" not in st.session_state:
     st.session_state.user = None
+if "page" not in st.session_state:
+    st.session_state.page = "login"
 if "project" not in st.session_state:
     st.session_state.project = {
         "title": "",
@@ -199,26 +165,34 @@ if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
 if "ask_context" not in st.session_state:
     st.session_state.ask_context = None
-if "show_planner" not in st.session_state:
-    st.session_state.show_planner = False
-
-# Try to auto-login remembered user (if within 24h)
-try_auto_login()
 
 # ---------------------------
-# Local Auth
+# Auto-login using cookie
+# ---------------------------
+cookie_user = get_cookie_user()
+
+if cookie_user and st.session_state.user is None:
+    st.session_state.user = cookie_user
+
+    saved_session = load_user_session(cookie_user)
+    if saved_session:
+        st.session_state.project = saved_session.get("project", st.session_state.project)
+        st.session_state.chat_history = saved_session.get("chat_history", [])
+        st.session_state.page = saved_session.get("page", "home")
+    else:
+        st.session_state.page = "home"
+
+# ---------------------------
+# Authentication
 # ---------------------------
 def signup_local(username: str, password: str):
-    if not username:
-        return False, "Username required."
     users = read_json(USERS_FILE, {})
 
     if username in users:
         return False, "Username already exists."
 
-    password_hash = hash_password(password)
     users[username] = {
-        "password_hash": password_hash,
+        "password_hash": hash_password(password),
         "created_at": datetime.utcnow().isoformat(),
         "id": str(uuid.uuid4())
     }
@@ -227,42 +201,35 @@ def signup_local(username: str, password: str):
 
 def login_local(username: str, password: str):
     users = read_json(USERS_FILE, {})
-    u = users.get(username)
-    if not u:
+    user = users.get(username)
+
+    if not user:
         return False, "User not found."
 
-    # Backwards-compatible: migrate old plain-text password if present
-    if "password_hash" in u:
-        if not verify_password(password, u["password_hash"]):
-            return False, "Incorrect password."
-    else:
-        if u.get("password") != password:
-            return False, "Incorrect password."
-        u["password_hash"] = hash_password(password)
-        u.pop("password", None)
-        users[username] = u
-        write_json(USERS_FILE, users)
+    if not verify_password(password, user["password_hash"]):
+        return False, "Incorrect password."
 
     return True, "Logged in."
 
 # ---------------------------
-# Project persistence
+# Project persistence helpers
 # ---------------------------
 def load_user_projects(username: str):
-    allp = read_json(PROJECTS_FILE, {})
-    return allp.get(username, {})
+    all_projects = read_json(PROJECTS_FILE, {})
+    return all_projects.get(username, {})
 
 def save_user_project(username: str, project: dict):
-    allp = read_json(PROJECTS_FILE, {})
-    if username not in allp:
-        allp[username] = {}
-    project["updated_at"] = datetime.utcnow().isoformat()
-    allp[username][project["title"]] = project
-    write_json(PROJECTS_FILE, allp)
-    persist_session()
+    all_projects = read_json(PROJECTS_FILE, {})
+    if username not in all_projects:
+        all_projects[username] = {}
 
+    project["updated_at"] = datetime.utcnow().isoformat()
+    all_projects[username][project["title"]] = project
+
+    write_json(PROJECTS_FILE, all_projects)
+    persist_session()
 # ---------------------------
-# Gemini AI helpers
+# Gemini AI setup
 # ---------------------------
 if HAS_GENAI and GEMINI_API_KEY:
     try:
@@ -270,28 +237,33 @@ if HAS_GENAI and GEMINI_API_KEY:
     except Exception:
         pass
 
-def call_gemini_text(prompt, max_tokens=400):
+def call_gemini_text(prompt):
     if not HAS_GENAI or not GEMINI_API_KEY:
-        return False, "Gemini AI not configured."
+        return False, "Gemini is not configured."
+
     try:
         model = genai.GenerativeModel(GEMINI_MODEL)
         resp = model.generate_content(prompt)
-        if resp and getattr(resp, "text", None):
+        if resp and hasattr(resp, "text") and resp.text:
             return True, resp.text.strip()
-        return False, "DayBot had no response."
-    except Exception:
-        return False, "DayBot is currently unavailable. Please try again."
+        else:
+            return False, "DayBot returned no response."
+    except Exception as e:
+        return False, f"DayBot error: {e}"
 
 # ---------------------------
-# Task parsing helpers
+# Task Parsing
 # ---------------------------
 def parse_plan_to_tasks(plan_text: str):
-    """Parse a 'Day 1: ... Day 8:' style text into 8 lists of task dicts."""
+    """
+    Parse Day 1: ... Day 8: format into structured 8 lists of task dicts.
+    """
     days = [[] for _ in range(8)]
     if not plan_text:
         return days
 
     blocks = re.split(r"(?=Day\s*\d+[:\-])", plan_text, flags=re.IGNORECASE)
+
     for i in range(1, 9):
         block = next(
             (b for b in blocks if re.match(fr"Day\s*{i}\b", b, flags=re.IGNORECASE)),
@@ -306,14 +278,15 @@ def parse_plan_to_tasks(plan_text: str):
             for line in content.splitlines()
             if line.strip()
         ]
+
         for text in lines:
             days[i - 1].append({"id": None, "text": text, "done": False})
 
-    nid = 0
+    next_id = 0
     for d in range(8):
         for t in days[d]:
-            t["id"] = nid
-            nid += 1
+            t["id"] = next_id
+            next_id += 1
 
     return days
 
@@ -321,11 +294,7 @@ def normalize_tasks(raw_tasks):
     normalized = []
     for t in raw_tasks:
         if isinstance(t, str):
-            normalized.append({
-                "id": None,
-                "text": t.strip(),
-                "done": False
-            })
+            normalized.append({"id": None, "text": t.strip(), "done": False})
         elif isinstance(t, dict):
             normalized.append({
                 "id": t.get("id"),
@@ -335,56 +304,60 @@ def normalize_tasks(raw_tasks):
     return normalized
 
 def assign_missing_ids(tasks_by_day):
-    all_ids = [
-        t["id"]
-        for day in tasks_by_day
-        for t in day
-        if t.get("id") is not None
-    ]
-    next_id = (max(all_ids) + 1) if all_ids else 0
+    all_ids = []
+    for day in tasks_by_day:
+        for t in day:
+            if t.get("id") is not None:
+                all_ids.append(t["id"])
+
+    next_id = max(all_ids) + 1 if all_ids else 0
+
     for day in tasks_by_day:
         for t in day:
             if t.get("id") is None:
                 t["id"] = next_id
                 next_id += 1
+
     return tasks_by_day
 
 # ---------------------------
-# AI plan generation
+# AI Plan Generation
 # ---------------------------
 def generate_8day_plan(title: str, desc: str):
     if not title.strip():
         return False, "Project title is required.", None
 
     prompt = f"""
-    You are DayBot, an expert project planner.
-    Create an 8-day detailed project plan for:
-    Title: {title}
-    Description: {desc}
+You are DayBot, an expert project planner.
+Create an 8-day detailed project plan.
 
-    Strictly follow this format:
+Title: {title}
+Description: {desc}
 
-    Day 1:
-    - Task 1
-    - Task 2
-    Day 2:
-    - Task 1
-    ...
-    Day 8:
-    - Task 1
-    """
+Strict format:
+
+Day 1:
+- Task 1
+- Task 2
+
+Day 2:
+- Task 1
+...
+Day 8:
+- Task 1
+"""
 
     ok, ai_text = call_gemini_text(prompt)
     if not ok:
-        return False, f"{ai_text}", None
+        return False, ai_text, None
 
-    parsed_days = parse_plan_to_tasks(ai_text)
-    parsed_days = assign_missing_ids(parsed_days)
+    parsed = parse_plan_to_tasks(ai_text)
+    parsed = assign_missing_ids(parsed)
 
     project = {
         "title": title.strip(),
         "description": desc.strip(),
-        "tasks": parsed_days,
+        "tasks": parsed,
         "generated_at": datetime.utcnow().isoformat(),
         "updated_at": datetime.utcnow().isoformat(),
         "raw_plan": ai_text.strip()
@@ -396,17 +369,17 @@ def generate_8day_plan(title: str, desc: str):
     st.session_state.page = "planner"
     persist_session()
 
-    return True, "AI 8-day plan generated successfully!", project
+    return True, "8-day plan generated!", project
 
 # ---------------------------
-# DayBot contextual response
+# DayBot contextual improvement
 # ---------------------------
 def ask_daybot_contextual(context, prompt):
-    combined_prompt = f"{context}\n\nUser request: {prompt}"
-    return call_gemini_text(combined_prompt)
+    combined = f"{context}\n\nUser request: {prompt}"
+    return call_gemini_text(combined)
 
 # ---------------------------
-# UI helpers
+# CSS Styling
 # ---------------------------
 ACCENT1 = "#7b2cbf"
 ACCENT2 = "#1a0536"
@@ -416,13 +389,41 @@ MUTED = "#bdb7d9"
 
 st.markdown(f"""
 <style>
-:root {{ --accent1: {ACCENT1}; --accent2: {ACCENT2}; --bg:{BG}; --text:{TEXT}; --muted:{MUTED}; }}
-html, body, #root {{ background: linear-gradient(180deg,var(--accent2),var(--bg)) !important; color: var(--text) !important; }}
-.header {{ background: linear-gradient(90deg,var(--accent1),var(--accent2)); padding:12px; border-radius:10px; margin-bottom:12px }}
-.card {{ background: rgba(255,255,255,0.03); padding:10px; border-radius:8px; }}
-.day-card {{ background: linear-gradient(135deg, rgba(123,44,191,0.06), rgba(26,5,54,0.03)); padding:8px; border-radius:8px; margin-bottom:8px }}
-.small {{ color: var(--muted); font-size:13px; }}
-.sidebar-spacer {{ height:200px; }}
+:root {{
+  --accent1: {ACCENT1};
+  --accent2: {ACCENT2};
+  --bg: {BG};
+  --text: {TEXT};
+  --muted: {MUTED};
+}}
+html, body, #root {{
+    background: linear-gradient(180deg, var(--accent2), var(--bg)) !important;
+    color: var(--text) !important;
+}}
+.header {{
+    background: linear-gradient(90deg, var(--accent1), var(--accent2));
+    padding: 12px;
+    border-radius: 10px;
+    margin-bottom: 12px;
+}}
+.card {{
+    background: rgba(255,255,255,0.03);
+    padding: 10px;
+    border-radius: 8px;
+}}
+.day-card {{
+    background: linear-gradient(135deg, rgba(123,44,191,0.06), rgba(26,5,54,0.03));
+    padding: 8px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+}}
+.small {{
+    color: var(--muted);
+    font-size: 13px;
+}}
+.sidebar-spacer {{
+    height: 200px;
+}}
 </style>
 """, unsafe_allow_html=True)
 
@@ -433,70 +434,62 @@ st.markdown(
 )
 
 # ---------------------------
-# Navigation helpers
+# Navigation helper
 # ---------------------------
 def go_to(page_name):
     st.session_state.page = page_name
     persist_session()
 
 # ---------------------------
-# Pages
+# LOGIN & SIGNUP PAGE
 # ---------------------------
 def page_login_signup():
     st.markdown('<div class="card"><strong>Login or Sign Up</strong></div>', unsafe_allow_html=True)
-    lcol, rcol = st.columns(2)
 
-    # Login
-    with lcol:
+    col1, col2 = st.columns(2)
+
+    # -------- LOGIN --------
+    with col1:
         st.subheader("Login")
-        login_user = st.text_input("Username", key="login_user")
-        login_pass = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Login", key="btn_login"):
-            ok, msg = login_local(login_user.strip(), login_pass)
-            if ok:
-                st.session_state.user = login_user.strip()
+        user = st.text_input("Username", key="login_user")
+        pw   = st.text_input("Password", type="password", key="login_pass")
 
-                # Load saved session (project + chat + last page) for this user
-                user_sess = load_user_session(st.session_state.user)
-                if user_sess:
-                    st.session_state.project = user_sess.get("project", st.session_state.project)
-                    st.session_state.chat_history = user_sess.get("chat_history", [])
-                    st.session_state.page = user_sess.get("page", "home")
+        if st.button("Login", key="btn_login"):
+            ok, msg = login_local(user.strip(), pw)
+            if ok:
+                st.session_state.user = user.strip()
+
+                loaded = load_user_session(st.session_state.user)
+                if loaded:
+                    st.session_state.project = loaded.get("project", st.session_state.project)
+                    st.session_state.chat_history = loaded.get("chat_history", [])
+                    st.session_state.page = loaded.get("page", "home")
                 else:
                     st.session_state.page = "home"
 
-                # Also load projects (for home dropdown if needed)
-                projects = load_user_projects(st.session_state.user)
-                if projects and not user_sess:
-                    last_title = max(
-                        projects.items(),
-                        key=lambda kv: kv[1].get("updated_at", kv[1].get("generated_at", ""))
-                    )[0]
-                    st.session_state.project = projects[last_title]
-
-                # Remember this user for 24h
-                set_auth_user(st.session_state.user)
+                set_cookie_user(st.session_state.user)
                 persist_session()
-                st.experimental_rerun()
+                st.rerun()
             else:
                 st.error(msg)
 
-    # Signup (optional)
-    with rcol:
+    # -------- SIGNUP --------
+    with col2:
         st.subheader("Sign Up")
         if not ALLOW_SIGNUP:
-            st.info("Sign up is disabled by the app owner.")
+            st.info("Signup is disabled by the app owner.")
             return
 
-        su_user = st.text_input("Choose username", key="su_user")
-        su_pass = st.text_input("Choose password", type="password", key="su_pass")
+        newu = st.text_input("Choose username", key="su_user")
+        newp = st.text_input("Choose password", type="password", key="su_pass")
+
         if st.button("Create account", key="btn_signup"):
-            if not su_user.strip() or not su_pass:
+            if not newu.strip() or not newp:
                 st.error("Enter username and password.")
             else:
-                ok, msg = signup_local(su_user.strip(), su_pass)
+                ok, msg = signup_local(newu.strip(), newp)
                 if ok:
-                    st.session_state.user = su_user.strip()
+                    st.session_state.user = newu.strip()
                     st.session_state.project = {
                         "title": "",
                         "description": "",
@@ -507,21 +500,25 @@ def page_login_signup():
                     }
                     st.session_state.chat_history = []
                     st.session_state.page = "home"
-                    set_auth_user(st.session_state.user)
+                    set_cookie_user(st.session_state.user)
                     persist_session()
-                    st.success("Account created; welcome!")
-                    st.experimental_rerun()
+                    st.success("Account created!")
+                    st.rerun()
                 else:
                     st.error(msg)
-
+# ---------------------------
+# HOME PAGE
+# ---------------------------
 def page_home():
     st.markdown('<div class="card"><strong>Home — Overview</strong></div>', unsafe_allow_html=True)
     st.markdown(f"### Welcome, **{st.session_state.user}**")
+
     projects = load_user_projects(st.session_state.user)
 
     left, right = st.columns([3, 1])
     with left:
         st.markdown("**Your projects**")
+
         if not projects:
             st.info("No projects yet. Click Generate new project.")
         else:
@@ -552,98 +549,91 @@ def page_home():
                 "updated_at": None,
                 "raw_plan": ""
             }
-            st.session_state.show_planner = False
             persist_session()
             go_to("create")
 
 # ---------------------------
-# Page: Create
+# CREATE PAGE
 # ---------------------------
 def page_create():
     st.header("Create New Project")
     proj = st.session_state.project
+
     title = st.text_input("Project Title", value=proj.get("title", ""))
     desc = st.text_area("Project Description", value=proj.get("description", ""), height=150)
 
-    generate_ai = st.button("🚀 Generate 8-Day Plan with AI", key="gen_ai")
-    if generate_ai:
+    if st.button("🚀 Generate 8-Day Plan with AI"):
         if not title.strip() or not desc.strip():
             st.warning("Enter both title and description.")
         else:
             with st.spinner("DayBot is creating your perfect 8-day plan..."):
                 ok, msg, project = generate_8day_plan(title, desc)
             if ok:
-                st.session_state.show_planner = True
                 st.success(msg)
+                st.rerun()
             else:
                 st.error(msg)
 
-    if st.session_state.show_planner:
-        page_planner()
-    else:
-        if st.session_state.project and st.button("🗓️ Open Planner"):
-            st.session_state.show_planner = True
-            persist_session()
-            page_planner()
+    if st.button("🗓️ Open Planner"):
+        go_to("planner")
 
 # ---------------------------
-# Page: Planner
+# PLANNER PAGE
 # ---------------------------
 def page_planner():
     proj = st.session_state.project
+
     st.title(f"📅 Planner — {proj.get('title', '')}")
     st.caption(proj.get("description", ""))
 
     raw_tasks = proj.get("tasks", [[] for _ in range(8)])
     tasks = []
+
     for day_index in range(8):
         day_tasks = raw_tasks[day_index] if day_index < len(raw_tasks) else []
         day_tasks = normalize_tasks(day_tasks)
         tasks.append(day_tasks)
+
     tasks = assign_missing_ids(tasks)
     proj["tasks"] = tasks
 
     for i in range(8):
-        with st.expander(f"**Day {i+1}**", expanded=(i == 0)):
+        with st.expander(f"Day {i+1}", expanded=(i == 0)):
             if tasks[i]:
                 for j, t in enumerate(tasks[i]):
-                    task_text = t.get("text", "")
-                    done = t.get("done", False)
+                    task_text = t["text"]
+                    done = t["done"]
+
                     c1, c2 = st.columns([0.9, 0.1])
-                    new_done = c1.checkbox(
-                        task_text,
-                        value=done,
-                        key=f"done_{i}_{j}"
-                    )
+                    new_done = c1.checkbox(task_text, value=done, key=f"done_{i}_{j}")
+
                     if new_done != done:
                         t["done"] = new_done
-                        proj["tasks"] = tasks
                         save_user_project(st.session_state.user, proj)
 
-                    if c2.button("❌", key=f"del_{i}_{j}"):
+                    if c2.button("❌", key=f"delete_{i}_{j}"):
                         tasks[i].pop(j)
                         proj["tasks"] = tasks
                         save_user_project(st.session_state.user, proj)
                         st.toast(f"Task removed from Day {i+1}")
-                        st.experimental_rerun()
+                        st.rerun()
+
             else:
                 st.info("No tasks yet.")
 
-            new_task = st.text_input(f"Add task Day {i+1}", key=f"task_input_{i}")
-            if st.button(f"Add to Day {i+1}", key=f"add_btn_{i}"):
+            new_task = st.text_input(f"Add task to Day {i+1}", key=f"newtask_{i}")
+            if st.button(f"Add to Day {i+1}", key=f"addbtn_{i}"):
                 if new_task.strip():
                     all_ids = [
-                        tt.get("id", -1)
-                        for dd in tasks
-                        for tt in dd
-                        if tt.get("id") is not None
+                        tt["id"] for dd in tasks for tt in dd if tt.get("id") is not None
                     ]
                     nid = (max(all_ids) + 1) if all_ids else 0
+
                     tasks[i].append({"id": nid, "text": new_task.strip(), "done": False})
                     proj["tasks"] = tasks
                     save_user_project(st.session_state.user, proj)
                     st.toast(f"Added to Day {i+1}")
-                    st.experimental_rerun()
+                    st.rerun()
 
     st.markdown("---")
     c1, c2 = st.columns(2)
@@ -654,59 +644,53 @@ def page_planner():
         go_to("home")
 
 # ---------------------------
-# Page: Chat
+# CHAT PAGE
 # ---------------------------
 def page_chat():
     st.markdown('<div class="card"><strong>Chat — DayBot</strong></div>', unsafe_allow_html=True)
-    st.markdown(
-        "<div class='small'>Ask DayBot project-related questions or improve tasks.</div>",
-        unsafe_allow_html=True
-    )
+    st.markdown("<div class='small'>Ask DayBot to improve tasks or clarify your project.</div>", unsafe_allow_html=True)
 
+    # Auto-improvement mode
     if st.session_state.ask_context:
         ctx = st.session_state.ask_context
-        now = datetime.utcnow().isoformat()
+        st.session_state.ask_context = None
 
+        now = datetime.utcnow().isoformat()
         prompt = (
-            f"Project: {ctx.get('project_title','')}\n"
-            f"Context: Day {ctx.get('day',0)+1}\n"
-            f"Task: {ctx.get('task_text','')}\n"
-            f"Provide 2 improved alternatives with reasons."
+            f"Project: {ctx['project_title']}\n"
+            f"Context: Day {ctx['day']+1}\n"
+            f"Task: {ctx['task_text']}\n"
+            "Provide improved alternatives with justification."
         )
 
         planning_context = (
-            st.session_state.project.get("raw_plan", "")
-            or st.session_state.project.get("description", "")
+            st.session_state.project.get("raw_plan") or
+            st.session_state.project.get("description")
         )
 
         ok, reply = ask_daybot_contextual(planning_context, prompt)
-        st.session_state.chat_history.append(
-            {"role": "user", "text": f"Improve task: {ctx.get('task_text','')}", "time": now}
-        )
-        if ok:
-            st.session_state.chat_history.append(
-                {"role": "daybot", "text": reply, "time": now}
-            )
-        else:
-            st.session_state.chat_history.append(
-                {"role": "daybot", "text": "DayBot unavailable.", "time": now}
-            )
-        st.session_state.ask_context = None
+
+        st.session_state.chat_history.append({"role": "user", "text": ctx["task_text"], "time": now})
+        st.session_state.chat_history.append({
+            "role": "daybot",
+            "text": reply if ok else "DayBot unavailable.",
+            "time": now
+        })
         persist_session()
 
-    for msg in st.session_state.chat_history[-100:]:
-        label = "You" if msg.get("role") == "user" else "DayBot"
-        st.markdown(f"**{label} ({msg.get('time')[:19]}):** {msg.get('text')}")
+    # Show chat history
+    for msg in st.session_state.chat_history[-200:]:
+        sender = "You" if msg["role"] == "user" else "DayBot"
+        st.markdown(f"**{sender} ({msg['time'][:19]}):** {msg['text']}")
 
+    # Input box
     st.markdown("---")
-    user_msg = st.text_input("Message to DayBot", key="chat_input")
+    txt = st.text_input("Message DayBot", key="chat_input")
     if st.button("Send", key="chat_send"):
-        if not user_msg.strip():
-            st.warning("Type a message first.")
-        else:
+        if txt.strip():
             now = datetime.utcnow().isoformat()
             st.session_state.chat_history.append(
-                {"role": "user", "text": user_msg.strip(), "time": now}
+                {"role": "user", "text": txt.strip(), "time": now}
             )
 
             context_parts = [
@@ -716,67 +700,67 @@ def page_chat():
             for i, day in enumerate(st.session_state.project.get("tasks", []), start=1):
                 context_parts.append(f"Day {i}:")
                 for t in day:
-                    context_parts.append(f"- {t.get('text')}")
+                    context_parts.append(f"- {t['text']}")
 
-            context = "\n".join(context_parts)
-            ok, reply = ask_daybot_contextual(context, user_msg.strip())
-            if ok:
-                st.session_state.chat_history.append(
-                    {"role": "daybot", "text": reply, "time": now}
-                )
-            else:
-                st.session_state.chat_history.append(
-                    {"role": "daybot", "text": "DayBot unavailable.", "time": now}
-                )
+            fullctx = "\n".join(context_parts)
+            ok, reply = ask_daybot_contextual(fullctx, txt.strip())
+
+            st.session_state.chat_history.append({
+                "role": "daybot",
+                "text": reply if ok else "DayBot unavailable.",
+                "time": now
+            })
             persist_session()
+            st.rerun()
+        else:
+            st.warning("Enter a message.")
 
+    # Auto-import improved plan if detected
     if st.session_state.chat_history:
         last = st.session_state.chat_history[-1]
-        if last.get("role") == "daybot":
-            txt = last.get("text", "")
+        if last["role"] == "daybot":
+            text = last["text"]
             if (
-                re.search(r"\bDay\s*1\b", txt, re.IGNORECASE) and
-                re.search(r"\bDay\s*8\b", txt, re.IGNORECASE)
+                re.search(r"\bDay\s*1\b", text, re.IGNORECASE)
+                and re.search(r"\bDay\s*8\b", text, re.IGNORECASE)
             ):
-                if st.button("Import last DayBot reply into tasks"):
-                    parsed = parse_plan_to_tasks(txt)
+                if st.button("Import Last Plan into Tasks"):
+                    parsed = parse_plan_to_tasks(text)
                     proj = st.session_state.project
-                    existing_tasks = proj.get("tasks", [[] for _ in range(8)])
-                    existing_tasks = assign_missing_ids(existing_tasks)
-                    proj["tasks"] = existing_tasks
+                    existing = proj["tasks"]
+                    existing = assign_missing_ids(existing)
 
                     all_ids = [
-                        tt.get("id")
-                        for dd in proj["tasks"]
-                        for tt in dd
-                        if tt.get("id") is not None
+                        t["id"] for day in existing for t in day if t.get("id") is not None
                     ]
                     nid = (max(all_ids) + 1) if all_ids else 0
 
                     for i in range(8):
                         for t in parsed[i]:
-                            text = t.get("text") if isinstance(t, dict) else str(t)
-                            proj["tasks"][i].append(
-                                {"id": nid, "text": text, "done": False}
-                            )
+                            txt2 = t["text"]
+                            existing[i].append({"id": nid, "text": txt2, "done": False})
                             nid += 1
 
+                    proj["tasks"] = existing
                     save_user_project(st.session_state.user, proj)
                     persist_session()
-                    st.success("Imported into tasks.")
-
+                    st.success("Imported plan!")
+                    st.rerun()
 # ---------------------------
-# Sidebar
+# SIDEBAR
 # ---------------------------
 def render_sidebar():
     with st.sidebar:
         st.markdown(f"### {st.session_state.user or ''}")
+
         pages = ["home", "create", "planner", "chat"]
         labels = ["Home", "Create Project", "Planner", "Chat"]
+
         try:
             idx = pages.index(st.session_state.page)
-        except Exception:
+        except:
             idx = 0
+
         sel = st.radio(
             "Navigate",
             labels,
@@ -784,16 +768,19 @@ def render_sidebar():
             key="sidebar_nav",
             label_visibility="collapsed"
         )
-        sel_page = pages[labels.index(sel)]
-        if sel_page != st.session_state.page:
-            go_to(sel_page)
+
+        selected_page = pages[labels.index(sel)]
+        if selected_page != st.session_state.page:
+            go_to(selected_page)
 
         st.markdown("<div class='sidebar-spacer'></div>", unsafe_allow_html=True)
         st.markdown("---")
+
+        # LOGOUT BUTTON
         if st.button("Logout"):
-            # Save final snapshot, then clear auth + in-memory state
             persist_session()
             clear_auth()
+
             st.session_state.user = None
             st.session_state.project = {
                 "title": "",
@@ -805,27 +792,38 @@ def render_sidebar():
             }
             st.session_state.chat_history = []
             st.session_state.page = "login"
+
             st.success("Logged out.")
-            st.experimental_rerun()
+            st.rerun()
 
 # ---------------------------
-# Main router
+# MAIN ROUTER
 # ---------------------------
 def main():
+    # If no user logged in → show login page
     if not st.session_state.user:
         page_login_signup()
         return
+
+    # Sidebar always visible after login
     render_sidebar()
-    if st.session_state.page == "home":
+
+    # Page Routing
+    page = st.session_state.page
+
+    if page == "home":
         page_home()
-    elif st.session_state.page == "create":
+    elif page == "create":
         page_create()
-    elif st.session_state.page == "planner":
+    elif page == "planner":
         page_planner()
-    elif st.session_state.page == "chat":
+    elif page == "chat":
         page_chat()
     else:
         page_home()
 
+# ---------------------------
+# ENTRY POINT
+# ---------------------------
 if __name__ == "__main__":
     main()
