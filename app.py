@@ -1,5 +1,4 @@
 # app.py
-# (Content from the 'app_fixed_final.py' version above)
 import os
 import json
 import copy
@@ -46,6 +45,7 @@ def ensure_file(path: Path, default):
 ensure_file(USERS_FILE, {})
 ensure_file(PROJECTS_FILE, {})
 
+# --- login helpers kept (unused) to avoid changing other parts ---
 def signup_local(username, password):
     users = read_json(USERS_FILE, {})
     if not username:
@@ -100,34 +100,10 @@ def call_gemini_text(prompt: str, max_output_tokens: int = 400):
     except Exception as e:
         return False, f"Gemini error: {e}"
 
+# --- removed login page entirely (kept function name but routes nowhere) ---
 def page_login_signup():
-    st.title("DayByDay — 8-Day Planner")
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("Login")
-        u = st.text_input("Username", key="login_user")
-        p = st.text_input("Password", type="password", key="login_pass")
-        if st.button("Login"):
-            ok, msg = login_local(u.strip(), p)
-            if ok:
-                st.session_state.user = u.strip()
-                st.session_state.page = "home"
-                st.rerun()
-            else:
-                st.error(msg)
-    with c2:
-        st.subheader("Sign Up")
-        u2 = st.text_input("New username", key="signup_user")
-        p2 = st.text_input("New password", type="password", key="signup_pass")
-        if st.button("Create Account"):
-            ok, msg = signup_local(u2.strip(), p2)
-            if ok:
-                # ✅ ONLY CHANGE: auto-login + redirect to main/home page
-                st.session_state.user = u2.strip()
-                st.session_state.page = "home"
-                st.rerun()
-            else:
-                st.error(msg)
+    # Login system removed on purpose.
+    st.stop()
 
 def page_home():
     st.header(f"Welcome, {st.session_state.user}")
@@ -208,32 +184,32 @@ def page_planner():
 
 def main():
     if "page" not in st.session_state:
-        st.session_state.page = "login"
-    if "user" not in st.session_state:
-        st.session_state.user = None
-    if not st.session_state.user:
-        page_login_signup()
+        st.session_state.page = "home"
+
+    # ✅ force a default user (no auth)
+    if "user" not in st.session_state or not st.session_state.user:
+        st.session_state.user = "guest"
+
+    st.sidebar.title("Menu")
+    st.sidebar.markdown(f"👤 {st.session_state.user}")
+
+    if st.sidebar.button("🏠 Home"):
+        st.session_state.page = "home"
+        st.rerun()
+    if st.sidebar.button("➕ New Project"):
+        st.session_state.page = "create"
+        st.rerun()
+
+    # Logout removed since there is no login now
+
+    if st.session_state.page == "home":
+        page_home()
+    elif st.session_state.page == "create":
+        page_create_project()
+    elif st.session_state.page == "planner":
+        page_planner()
     else:
-        st.sidebar.title("Menu")
-        st.sidebar.markdown(f"👤 {st.session_state.user}")
-        if st.sidebar.button("🏠 Home"):
-            st.session_state.page = "home"
-            st.rerun()
-        if st.sidebar.button("➕ New Project"):
-            st.session_state.page = "create"
-            st.rerun()
-        if st.sidebar.button("🚪 Logout"):
-            st.session_state.user = None
-            st.session_state.page = "login"
-            st.rerun()
-        if st.session_state.page == "home":
-            page_home()
-        elif st.session_state.page == "create":
-            page_create_project()
-        elif st.session_state.page == "planner":
-            page_planner()
-        else:
-            page_home()
+        page_home()
 
 if __name__ == "__main__":
     main()
